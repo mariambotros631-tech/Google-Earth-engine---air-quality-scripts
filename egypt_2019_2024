@@ -200,3 +200,4 @@ print('Study period:', startDate.format('YYYY-MM'), '→', endDate.format('YYYY-
 
 // شغّل عنصرين في البداية لو عايز تتأكد السرعة، ثم فعّل الباقي
 configs.forEach(runMonthly);
+
