@@ -1,0 +1,202 @@
+// ================== CONFIG ==================
+var endDate   = ee.Date('2023-12-31');
+var startDate = endDate.advance(-5, 'year');   // آخر 5 سنين
+
+// مصر - حدود المستوى الأول (المحافظات)
+var lvl1 = ee.FeatureCollection('FAO/GAUL/2015/level1')
+  .filter(ee.Filter.eq('ADM0_NAME', 'Egypt'));
+
+// نطاق يغطي دلتا النيل (عدّليه لو محتاج)
+var deltaAOI = ee.Geometry.Polygon([
+  [[29.4, 31.9], [32.6, 31.9], [32.6, 30.0], [29.4, 30.0], [29.4, 31.9]]
+]);
+
+// المحافظات التي تتقاطع مع الدلتا
+var deltaGovs = lvl1.filterBounds(deltaAOI)
+  .map(function(f){ return f.set('name', f.get('ADM1_NAME')); });
+
+Map.centerObject(deltaAOI, 7);
+Map.addLayer(deltaGovs, {color:'yellow'}, 'Delta Governorates');
+
+var SCALE = 30000;          // أكثر خفة
+var SIMPLE_TOL = 5000;
+var deltaGovsSimple = deltaGovs.map(function(f){
+  return f.simplify(SIMPLE_TOL).copyProperties(f);
+});
+
+// قناع جودة عام (لو يوجد qa_value)
+function maskByQa(img){
+  return ee.Image(ee.Algorithms.If(
+    img.bandNames().contains('qa_value'),
+    img.updateMask(img.select('qa_value').gte(0.75)),
+    img
+  ));
+}
+
+// تبويب الشهور بين تاريخين
+function monthlySequence(start, end){
+  var n = end.difference(start, 'month').toInt();
+  return ee.List.sequence(0, n.subtract(1)).map(function(i){
+    var mStart = start.advance(ee.Number(i), 'month');
+    var mEnd   = mStart.advance(1, 'month');
+    return ee.Dictionary({start: mStart, end: mEnd, label: mStart.format('YYYY-MM')});
+  });
+}
+
+// يبني ImageCollection شهري (mean) من مجموعة صور
+function monthlyComposite(ic, band){
+  var months = monthlySequence(startDate, endDate);
+  var mc = ee.ImageCollection.fromImages(
+    months.map(function(d){
+      d = ee.Dictionary(d);
+      var col = ic.filterDate(ee.Date(d.get('start')), ee.Date(d.get('end')));
+      // composite شهري
+      var img = col.mean()
+        .set('system:time_start', ee.Date(d.get('start')).millis())
+        .set('ym', d.get('label'));
+      return img.select(band);
+    })
+  );
+  return mc;
+}
+
+// يشغّل لكل مُلوِّث: يبني شهري، يرسم، ويجهّز CSV
+function runMonthly(cfg){
+  // cfg: { id, band, title, unit, visMin, visMax, palette }
+  var ic = ee.ImageCollection(cfg.id)
+    .filterDate(startDate, endDate)
+    .filterBounds(deltaAOI)
+    .map(maskByQa)
+    .select(cfg.band);
+
+  // خريطة متوسط 5 سنين (اختياري)
+  var mean5y = ic.mean().clip(deltaAOI);
+  Map.addLayer(mean5y, {min: cfg.visMin, max: cfg.visMax, palette: cfg.palette},
+               cfg.title + ' (5y mean)', false);
+
+  // ImageCollection شهري
+  var monthlyIC = monthlyComposite(ic, cfg.band);
+
+  // شارت شهري: خط لكل محافظة
+  var chart = ui.Chart.image.seriesByRegion({
+    imageCollection: monthlyIC,
+    band: cfg.band,
+    regions: deltaGovsSimple,
+    reducer: ee.Reducer.mean(),
+    scale: SCALE,
+    xProperty: 'system:time_start',
+    seriesProperty: 'name'
+  })
+  .setChartType('LineChart')
+  .setOptions({
+    title: cfg.title + ' — Monthly mean over Nile Delta governorates (2019–2023)',
+    hAxis: {title: 'Month'},
+    vAxis: {title: cfg.title + (cfg.unit ? ' ('+cfg.unit+')' : '')},
+    lineWidth: 2,
+    legend: {position: 'right'}
+  });
+
+  print(cfg.title + ' (monthly by governorate):', chart);
+
+  // جدول شهري للتصدير: date, governorate, value
+  var monthlyTable = monthlyIC.map(function(img){
+    var ym = ee.Date(img.get('system:time_start')).format('YYYY-MM');
+    var reduced = img.reduceRegions({
+      collection: deltaGovsSimple,
+      reducer: ee.Reducer.mean(),
+      scale: SCALE,
+      tileScale: 2,
+      maxPixelsPerRegion: 1e8
+    }).map(function(f){
+      return f.set({
+        date: ym,
+        governorate: f.get('name'),
+        value: f.get('mean')
+      });
+    });
+    return reduced;
+  }).flatten().filter(ee.Filter.notNull(['value']));
+
+  print(cfg.title + ' (monthly sample):', monthlyTable.limit(10));
+
+  // Export CSV (Task في تبويب Tasks)
+  Export.table.toDrive({
+    collection: monthlyTable,
+    description: cfg.title.replace(/\s+/g,'_') + '_Monthly_DeltaGovs_' +
+                 startDate.format('YYYY').getInfo() + '_' + endDate.format('YYYY').getInfo(),
+    fileFormat: 'CSV'
+  });
+}
+
+// ================== POLLUTANTS ==================
+var configs = [
+  // NO2 (mol/m²)
+  {
+    id:'COPERNICUS/S5P/OFFL/L3_NO2',
+    band:'NO2_column_number_density',
+    title:'NO₂ column density',
+    unit:'mol/m²',
+    visMin:2e-5, visMax:2e-4,
+    palette:['black','blue','purple','cyan','green','yellow','red']
+  },
+  // O3 (mol/m²)
+  {
+    id:'COPERNICUS/S5P/OFFL/L3_O3',
+    band:'O3_column_number_density',
+    title:'O₃ column density',
+    unit:'mol/m²',
+    visMin:0.12, visMax:0.15,
+    palette:['blue','purple','cyan','green','yellow','orange','red']
+  },
+  // CO (mol/m²)
+  {
+    id:'COPERNICUS/S5P/OFFL/L3_CO',
+    band:'CO_column_number_density',
+    title:'CO column density',
+    unit:'mol/m²',
+    visMin:0.02, visMax:0.05,
+    palette:['black','blue','green','yellow','orange','red']
+  },
+  // SO2 (mol/m²)
+  {
+    id:'COPERNICUS/S5P/OFFL/L3_SO2',
+    band:'SO2_column_number_density',
+    title:'SO₂ column density',
+    unit:'mol/m²',
+    visMin:5e-5, visMax:2e-4,
+    palette:['white','cyan','green','yellow','orange','red']
+  },
+  // HCHO (mol/m²)
+  {
+    id:'COPERNICUS/S5P/OFFL/L3_HCHO',
+    band:'tropospheric_HCHO_column_number_density',
+    title:'HCHO (tropospheric column)',
+    unit:'mol/m²',
+    visMin:3e-6, visMax:1.5e-5,
+    palette:['black','purple','blue','cyan','green','yellow','red']
+  },
+  // CH4 (ppbv تقريبًا)
+  {
+    id:'COPERNICUS/S5P/OFFL/L3_CH4',
+    band:'CH4_column_volume_mixing_ratio_dry_air',
+    title:'CH₄ VMR (dry air)',
+    unit:'ppbv',
+    visMin:1750, visMax:2000,
+    palette:['blue','cyan','green','yellow','orange','red']
+  },
+  // UV Aerosol Index
+  {
+    id:'COPERNICUS/S5P/OFFL/L3_AER_AI',
+    band:'absorbing_aerosol_index',
+    title:'UV Absorbing Aerosol Index',
+    unit:'',
+    visMin:-1, visMax:3,
+    palette:['#2c7bb6','#abd9e9','#ffffbf','#fdae61','#d7191c']
+  }
+];
+
+// ================== RUN ==================
+print('Study period:', startDate.format('YYYY-MM'), '→', endDate.format('YYYY-MM'));
+
+// شغّل عنصرين في البداية لو عايز تتأكد السرعة، ثم فعّل الباقي
+configs.forEach(runMonthly);
